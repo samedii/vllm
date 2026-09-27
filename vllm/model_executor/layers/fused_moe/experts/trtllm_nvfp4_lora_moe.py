@@ -41,10 +41,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_lora_moe import (
 from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
     TrtLlmNvFp4ExpertsBase,
 )
-from vllm.model_executor.layers.fused_moe.utils import (
-    fi_moe_largest_bucket,
-    trtllm_moe_pack_topk_ids_weights,
-)
+from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
 )
@@ -163,7 +160,7 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
-        packed_topk_ids: torch.Tensor,
+        topk_ids_and_weights: tuple[torch.Tensor, torch.Tensor],
         gemm1_lora_delta: torch.Tensor | None,
         global_num_experts: int,
         a1q_scale: torch.Tensor | None,
@@ -188,7 +185,7 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
             do_finalize = gemm1_lora_delta is None
 
         ret = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk_ids,
+            topk_ids=topk_ids_and_weights,
             routing_bias=None,
             hidden_states=hidden_states,
             hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
@@ -258,6 +255,8 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
     ):
         assert activation == MoEActivation.SILU
         assert not apply_router_weight_on_input
+        # DeepEP produces int64 indexes; the routed kernel wants int32.
+        topk_ids = topk_ids.to(dtype=torch.int32)
         num_tokens = hidden_states.size(0)
         assert num_tokens <= self._get_chunk_size(), (
             "LoRA NVFP4 path does not chunk; raise chunking if this fires"
@@ -272,9 +271,7 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
-                packed_topk_ids=trtllm_moe_pack_topk_ids_weights(
-                    topk_ids, topk_weights
-                ),
+                topk_ids_and_weights=(topk_ids, topk_weights),
                 gemm1_lora_delta=None,
                 global_num_experts=global_num_experts,
                 a1q_scale=a1q_scale,
@@ -351,7 +348,7 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
-            packed_topk_ids=trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights),
+            topk_ids_and_weights=(topk_ids, topk_weights),
             gemm1_lora_delta=gemm1_lora_delta,
             global_num_experts=global_num_experts,
             a1q_scale=a1q_scale,
