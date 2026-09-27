@@ -233,6 +233,27 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
             )
         return ret
 
+    def _static_lora_chunk_tokens(self) -> int:
+        """Largest token chunk for the static-scale (E2m1 out) kernel with a
+        LoRA delta.
+
+        FlashInfer 0.6.18 advertises tile_N 192 for static E2m1 activations
+        (``FP4BlockScaleLauncher::getSupportedTileNums``) and, with autotune
+        off, picks the smaller neighbour of ``nextPow2(tokens*top_k/E)`` as
+        the default tile - 192 as soon as tokens*top_k/E > 128. The cubin set
+        has no ``Bmm_E2m1_E2m1E2m1_*_t128x192*_biasBfloat16Mn`` kernel, so
+        that default tile fails runner construction ("No kernel found for the
+        given options ... mTileSize: 192, mBiasType: 3") on the LoRA path
+        only. Chunking so that tokens*top_k/E <= 128 keeps the default tile
+        at <= 128, where LoRA-bias kernels exist. Per-token mode never
+        advertises 192 and is unaffected. Rounded down to a multiple of 128
+        so per-token FP4 block-scale rows stay aligned.
+        """
+        if self.per_token_activation:
+            return self._get_chunk_size()
+        max_tokens = (128 * self.moe_config.num_experts) // self.topk
+        return max(128, (max_tokens // 128) * 128)
+
     # ---- forward ----
 
     def apply(
@@ -344,15 +365,21 @@ class TrtLlmNvFp4LoRAExperts(TrtLlmNvFp4ExpertsBase, _TrtLlmLoRAExpertsBase):
             add_inputs=False,
             swap_w13_slices=True,
         )
-        self.invoke_routed_moe(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_ids_and_weights=(topk_ids, topk_weights),
-            gemm1_lora_delta=gemm1_lora_delta,
-            global_num_experts=global_num_experts,
-            a1q_scale=a1q_scale,
-            output=output,
-            do_finalize=True,
-            activation=activation,
-        )
+        chunk = self._static_lora_chunk_tokens()
+        for start in range(0, num_tokens, chunk):
+            end = min(start + chunk, num_tokens)
+            self.invoke_routed_moe(
+                hidden_states=hidden_states[start:end],
+                w1=w1,
+                w2=w2,
+                topk_ids_and_weights=(
+                    topk_ids[start:end],
+                    topk_weights[start:end],
+                ),
+                gemm1_lora_delta=gemm1_lora_delta[start:end],
+                global_num_experts=global_num_experts,
+                a1q_scale=None if a1q_scale is None else a1q_scale[start:end],
+                output=output[start:end],
+                do_finalize=True,
+                activation=activation,
+            )
