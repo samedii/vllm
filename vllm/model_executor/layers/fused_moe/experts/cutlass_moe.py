@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+from collections.abc import Callable
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -17,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+)
+from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
+    LoRAExpertsMixin,
 )
 from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     MoEPermuteScratch,
@@ -519,9 +524,21 @@ def run_cutlass_moe_fp4(
     apply_router_weight_on_input: bool = False,
     *,
     activation_config: ApplyMoEActivationConfig | None = None,
+    lora_w13_hook: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+    lora_w2_hook: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]
+    | None = None,
 ) -> None:
     """
     MoE implementation for FP4 Inputs
+
+    lora_w13_hook(c1, c_map): optional; called after GEMM1 with the
+    expert-sorted (m*topk, w1_n) bf16 output and the pair->sorted-row map
+    (c_map[flat_pair] = sorted_row). Must add the W13 LoRA delta into c1
+    in place.
+    lora_w2_hook(c3w, c2, c_map): optional; called after GEMM2 with
+    c3w = (m, topk, k) routed-weighted bf16 partial outputs in token order,
+    c2 = expert-sorted (m*topk, n) bf16 post-activation input to GEMM2 and
+    c_map. Must add the W2 LoRA delta into c3w in place.
 
     # Gemm 1
     a: Input tensor: [m, k] (half/bfloat16)
@@ -583,6 +600,11 @@ def run_cutlass_moe_fp4(
     topk = topk_ids.size(1)
     out_dtype = a.dtype
     num_topk = topk_ids.size(1)
+    lora_enabled = lora_w13_hook is not None or lora_w2_hook is not None
+    if lora_enabled and apply_router_weight_on_input:
+        raise NotImplementedError(
+            "cutlass_moe_fp4 LoRA hooks do not support apply_router_weight_on_input"
+        )
 
     expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
     blockscale_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
@@ -640,9 +662,16 @@ def run_cutlass_moe_fp4(
         blockscale_offsets[:-1],
     )
     del rep_a_fp4, rep_a_blockscale
-    if activation == MoEActivation.SILU and (
-        activation_config is None or activation_config.clamp_limit is None
+    if lora_w13_hook is not None:
+        # c1 is expert-sorted; the hook scatters its token-order delta via c_map.
+        lora_w13_hook(c1, c_map)
+    if (
+        not lora_enabled
+        and activation == MoEActivation.SILU
+        and (activation_config is None or activation_config.clamp_limit is None)
     ):
+        # (Under LoRA the unfused branch below is used so that a bf16
+        # post-activation c2 exists for the W2 LoRA input.)
         # Fused SiLU+Mul+NVFP4 quantization
         # Note: c2 workspace is no longer needed since SiLU is fused with quantization.
         # c3 reuses workspace13 after c1 is consumed.
@@ -676,7 +705,16 @@ def run_cutlass_moe_fp4(
     c3 = ops.shuffle_rows(c3, c_map)
 
     assert output.dtype == out_dtype
-    if not apply_router_weight_on_input:
+    if lora_w2_hook is not None:
+        # Pre-apply the routing weights: the fused MoE LoRA W2 kernel
+        # multiplies its own delta by the routed weight, so the base term
+        # must already be weighted before the in-place add.
+        c3w = c3.view(m, num_topk, k) * topk_weights.view(m, num_topk, 1).to(
+            out_dtype
+        )
+        lora_w2_hook(c3w, c2, c_map)
+        output.copy_(c3w.sum(dim=1), non_blocking=True)
+    elif not apply_router_weight_on_input:
         output.copy_(
             (
                 c3.view(m, num_topk, k)
@@ -691,6 +729,17 @@ def run_cutlass_moe_fp4(
 
 class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
     """CUTLASS FP4 fused MoE expert implementation."""
+
+    def _lora_hooks(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+    ) -> tuple[Callable | None, Callable | None]:
+        return None, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Fuse activation scales into w_scale_2 in-place so that
@@ -788,6 +837,9 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
     ):
         e, m, n, k, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
         n = w2.shape[2] * 2
+        lora_w13_hook, lora_w2_hook = self._lora_hooks(
+            hidden_states, w1, w2, topk_weights, topk_ids, expert_map
+        )
 
         run_cutlass_moe_fp4(
             output=output,
@@ -812,7 +864,105 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
             activation_config=self.activation_config,
+            lora_w13_hook=lora_w13_hook,
+            lora_w2_hook=lora_w2_hook,
         )
+
+
+class CutlassExpertsFp4LoRA(LoRAExpertsMixin, CutlassExpertsFp4):
+    """CutlassExpertsFp4 with fused MoE LoRA (rank-r expert adapters).
+
+    LoRA is injected at the two points Marlin uses: the W13 delta is added
+    to the GEMM1 output before the activation, the W2 delta to the routed
+    partial outputs before the top-k reduction. The base kernel path is
+    unchanged when no LoRA context is set (e.g. the MTP drafter's MoE).
+    Restrictions: TP1 / EP1 (no expert_map), sequential LoRA kernels
+    (``aux_stream`` is ignored), ``apply_router_weight_on_input`` unsupported.
+    Selected only when ``VLLM_NVFP4_MOE_LORA_CUTLASS=1``.
+    """
+
+    def _lora_hooks(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+    ) -> tuple[Callable | None, Callable | None]:
+        ctx = self._lora_context
+        if ctx is None:
+            return None, None
+        logger.info_once(
+            "NVFP4 MoE LoRA: using CutlassExpertsFp4LoRA "
+            "(vLLM CUTLASS + LoRAExpertsMixin)"
+        )
+        if expert_map is not None:
+            raise NotImplementedError(
+                "CutlassExpertsFp4LoRA does not support expert_map (EP>1)"
+            )
+        m = hidden_states.size(0)
+        top_k_num = topk_ids.size(1)
+        # hidden_states is already the bf16 activation here
+        # (expects_unquantized_inputs), so it is a valid LoRA input; prefer
+        # the unmodified copy stashed by the modular kernel when it matches.
+        lora_x = hidden_states
+        orig = ctx.original_hidden_states
+        if orig is not None and orig.shape == hidden_states.shape:
+            lora_x = orig
+        state: dict = {}
+
+        def w13_hook(c1: torch.Tensor, c_map: torch.Tensor) -> None:
+            # The punica kernels write y rows at the flat (token, slot) pair
+            # index and skip rows without an active adapter, so accumulate
+            # into a zeroed token-order buffer and scatter it into the
+            # expert-sorted c1 (c_map is a bijection when expert_map is None).
+            delta = torch.zeros_like(c1)
+            (
+                sorted_token_ids_lora,
+                expert_ids_lora,
+                num_tokens_post_padded_lora,
+                token_lora_mapping,
+            ) = self.apply_w13_lora(
+                ctx,
+                y=delta,
+                x=lora_x,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                expert_map=expert_map,
+                w1=w1,
+                w2=w2,
+                num_tokens=m,
+                top_k_num=top_k_num,
+            )
+            state.update(
+                sorted=sorted_token_ids_lora,
+                eids=expert_ids_lora,
+                npad=num_tokens_post_padded_lora,
+                tlm=token_lora_mapping,
+            )
+            c1.index_add_(0, c_map, delta)
+
+        def w2_hook(c3w: torch.Tensor, c2: torch.Tensor, c_map: torch.Tensor) -> None:
+            # c2 is expert-sorted; the W2 kernel indexes x by flat pair, so
+            # bring the post-activation rows back to token order first.
+            x_tok = c2.index_select(0, c_map)
+            self.apply_w2_lora(
+                ctx,
+                y=c3w,
+                x=x_tok,
+                topk_weights=topk_weights,
+                sorted_token_ids_lora=state["sorted"],
+                expert_ids_lora=state["eids"],
+                num_tokens_post_padded_lora=state["npad"],
+                token_lora_mapping=state["tlm"],
+                num_tokens=m,
+                w1=w1,
+                w2=w2,
+                top_k_num=top_k_num,
+            )
+
+        return w13_hook, w2_hook
 
 
 def run_cutlass_moe_mxfp4(
