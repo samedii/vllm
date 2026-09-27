@@ -25,13 +25,13 @@ from tests.kernels.utils import torch_moe
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    maybe_make_prepare_finalize,
+)
 from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
     CutlassExpertsFp4,
     CutlassExpertsFp4LoRA,
-)
-from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-    maybe_make_prepare_finalize,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
