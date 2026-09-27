@@ -318,6 +318,7 @@ if TYPE_CHECKING:
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
+    VLLM_NVFP4_MOE_LORA_CUTLASS: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
@@ -2145,6 +2146,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overlap the base layer compute with the LoRA fast path).
     "VLLM_LORA_ENABLE_DUAL_STREAM": lambda: bool(
         int(os.getenv("VLLM_LORA_ENABLE_DUAL_STREAM", "0"))
+    ),
+    # If set, NVFP4 MoE layers with LoRA enabled may use the vLLM CUTLASS
+    # experts kernel (CutlassExpertsFp4LoRA, LoRA injected between the
+    # separate GEMM1 / activation / GEMM2 calls) instead of falling back
+    # to Marlin. Experimental; TP1 / EP1 only.
+    "VLLM_NVFP4_MOE_LORA_CUTLASS": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_MOE_LORA_CUTLASS", "0"))
     ),
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
