@@ -263,6 +263,38 @@ def select_nvfp4_moe_backend(
 
         raise ValueError(_make_log_unsupported(backend, reason))
 
+    # Fork experiment (VLLM_NVFP4_MOE_LORA_TRTLLM): with LoRA enabled, offer
+    # the LoRA-aware TRT-LLM NVFP4 experts before the ordered list so the
+    # base GEMMs stay on the trtllm-gen kernel instead of Marlin. Off by
+    # default; only taken under "auto" or an explicit flashinfer_trtllm.
+    if config.is_lora_enabled and config.moe_backend in ("auto", "flashinfer_trtllm"):
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_lora_moe import (  # noqa: E501
+            TrtLlmNvFp4LoRAExperts,
+            nvfp4_lora_trtllm_mode,
+        )
+
+        if nvfp4_lora_trtllm_mode() is not None:
+            supported, reason = TrtLlmNvFp4LoRAExperts.is_supported_config(
+                TrtLlmNvFp4LoRAExperts,
+                config,
+                weight_key,
+                activation_key,
+                activation_format,
+            )
+            if supported:
+                logger.info_once(
+                    "Using 'flashinfer_trtllm' NvFp4 MoE backend with LoRA "
+                    "(TrtLlmNvFp4LoRAExperts, VLLM_NVFP4_MOE_LORA_TRTLLM=%s).",
+                    nvfp4_lora_trtllm_mode(),
+                )
+                return NvFp4MoeBackend.FLASHINFER_TRTLLM, TrtLlmNvFp4LoRAExperts
+            logger.warning_once(
+                "VLLM_NVFP4_MOE_LORA_TRTLLM set but TrtLlmNvFp4LoRAExperts does "
+                "not support the deployment configuration since %s; falling "
+                "through to the default selection.",
+                reason,
+            )
+
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
     if runner_backend != "auto":

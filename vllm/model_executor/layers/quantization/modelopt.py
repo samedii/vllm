@@ -1013,6 +1013,24 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
 
+        # Fork experiment (VLLM_NVFP4_MOE_PER_TOKEN_ACT): per-token activation
+        # quantization on the TRT-LLM backend. The kernel derives the
+        # activation global scale per token, so the calibrated static input
+        # scales are neutralized to 1.0 (mirrors quantization/online/nvfp4.py).
+        per_token_activation = (
+            envs.VLLM_NVFP4_MOE_PER_TOKEN_ACT
+            and self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
+        )
+        if per_token_activation:
+            logger.warning_once(
+                "VLLM_NVFP4_MOE_PER_TOKEN_ACT=1: ModelOpt NVFP4 MoE activations "
+                "are quantized per token; calibrated static input scales are "
+                "replaced by 1.0 (quant recipe change)."
+            )
+            ones = torch.ones_like(layer.w13_input_scale)
+            replace_parameter(layer, "w13_input_scale", ones)
+            replace_parameter(layer, "w2_input_scale", ones.clone())
+
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.experts_cls is not None
@@ -1022,6 +1040,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             backend=self.nvfp4_backend,
             routing_tables=layer._expert_routing_tables(),
+            per_token_activation=per_token_activation,
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
