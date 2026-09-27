@@ -120,8 +120,14 @@ def backend_to_kernel_cls(
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
             CutlassExpertsFp4,
+            CutlassExpertsFp4LoRA,
         )
 
+        if envs.VLLM_NVFP4_MOE_LORA_CUTLASS:
+            # The base class fails the LoRA gate in is_supported_config, the
+            # LoRA subclass passes it; without LoRA the base class is picked
+            # as before.
+            return [CutlassExpertsFp4, CutlassExpertsFp4LoRA]
         return [CutlassExpertsFp4]
 
     elif backend == NvFp4MoeBackend.MARLIN:
