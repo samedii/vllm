@@ -941,12 +941,21 @@ class CutlassExpertsFp4LoRA(LoRAExpertsMixin, CutlassExpertsFp4):
                 npad=num_tokens_post_padded_lora,
                 tlm=token_lora_mapping,
             )
-            c1.index_add_(0, c_map, delta)
+            # Invalid routes (topk_id < 0 or >= E) carry the out-of-range
+            # sentinel c_map == m * top_k; shuffle_rows zeroes them, but
+            # index_add_ would assert. Clamp the index and zero those rows
+            # (no boolean indexing: keeps the path CUDA-graph safe).
+            rows = c1.size(0)
+            valid = (c_map < rows).unsqueeze(1)
+            delta.mul_(valid)
+            c1.index_add_(0, c_map.clamp_max(rows - 1), delta)
+            state.update(valid=valid, cmap=c_map.clamp_max(rows - 1))
 
         def w2_hook(c3w: torch.Tensor, c2: torch.Tensor, c_map: torch.Tensor) -> None:
             # c2 is expert-sorted; the W2 kernel indexes x by flat pair, so
             # bring the post-activation rows back to token order first.
-            x_tok = c2.index_select(0, c_map)
+            x_tok = c2.index_select(0, state["cmap"])
+            x_tok.mul_(state["valid"])
             self.apply_w2_lora(
                 ctx,
                 y=c3w,

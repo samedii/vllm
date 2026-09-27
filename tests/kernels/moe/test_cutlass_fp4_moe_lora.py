@@ -21,7 +21,7 @@ from tests.kernels.quantization.nvfp4_utils import (
     FLOAT8_E4M3_MAX,
     dequantize_nvfp4_to_dtype,
 )
-from tests.kernels.utils import torch_moe
+from tests.kernels.utils import torch_experts, torch_moe
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
@@ -71,6 +71,7 @@ def _make_kernel(experts, moe_config, quant_config):
 @pytest.mark.parametrize("topk", [2, 6])
 @pytest.mark.parametrize("rank", [8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("invalid_frac", [0.0, 0.25])
 @torch.inference_mode()
 def test_cutlass_fp4_moe_lora_hooks(
     m: int,
@@ -80,6 +81,7 @@ def test_cutlass_fp4_moe_lora_hooks(
     topk: int,
     rank: int,
     dtype: torch.dtype,
+    invalid_frac: float,
     workspace_init,
 ):
     set_random_seed(7)
@@ -102,6 +104,12 @@ def test_cutlass_fp4_moe_lora_hooks(
         )
         score = torch.randn((m, e), device="cuda", dtype=dtype)
         topk_weights, topk_ids, _ = fused_topk(a, score, topk, renormalize=False)
+        if invalid_frac > 0:
+            # Invalid routes (as vLLM emits for dropped / masked slots): the
+            # CUTLASS data kernel gives them an out-of-range c_map sentinel.
+            drop = torch.rand(topk_ids.shape, device="cuda") < invalid_frac
+            drop[0, 0] = True
+            topk_ids = topk_ids.masked_fill(drop, -1)
 
         a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
         a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
@@ -209,8 +217,9 @@ def test_cutlass_fp4_moe_lora_hooks(
             )
         w1_merged = (w1_d.float() + b13.float() @ a13.float()).to(dtype)
         w2_merged = (w2_d.float() + b2.float() @ a2.float()).to(dtype)
-        ref_lora = torch_moe(a_in_dtype, w1_merged, w2_merged, score, topk)
-        ref_base = torch_moe(a_in_dtype, w1_d, w2_d, score, topk)
+        # torch_experts skips ids outside [0, e), like the kernels do.
+        ref_lora = torch_experts(a_in_dtype, w1_merged, w2_merged, topk_weights, topk_ids)
+        ref_base = torch_experts(a_in_dtype, w1_d, w2_d, topk_weights, topk_ids)
 
         # The adapter must actually move the output (guards a trivially
         # passing test) ...
